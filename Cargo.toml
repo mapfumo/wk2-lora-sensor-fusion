@@ -29,6 +29,10 @@ sht3x = "0.1.1"
 heapless = "0.8"
 nb = "1.1"
 
+[[bin]]
+name = "node2"
+path = "src/bin/node2.rs"
+
 [profile.release]
 debug = true
 lto = true

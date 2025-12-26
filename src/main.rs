@@ -33,8 +33,10 @@ mod app {
     use core::time::Duration;
 
     // --- Configuration Constants ---
+    const NODE_ID: &str = "N1";              // Node identifier for display
     const AUTO_TX_INTERVAL_SECS: u32 = 10;  // Auto-transmit every 10 seconds
-    const DEBOUNCE_MS: u32 = 200;            // Button debounce time in milliseconds
+    const NETWORK_ID: u8 = 18;               // LoRa network ID
+    const LORA_FREQ: u32 = 915;              // LoRa frequency in MHz (915 for US)
 
     // --- Bridge for embedded-hal 1.0 -> 0.2.7 ---
     pub struct I2cCompat<I2C>(pub I2C);
@@ -89,6 +91,23 @@ mod app {
         tx_countdown: u32,     // Seconds until next auto-transmit
     }
 
+    // Helper function to send AT command and wait for response
+    fn send_at_command(uart: &mut Serial<pac::UART4>, cmd: &str) {
+        defmt::info!("Sending AT command: {}", cmd);
+
+        // Send command
+        for byte in cmd.as_bytes() {
+            let _ = nb::block!(uart.write(*byte));
+        }
+
+        // Send \r\n
+        let _ = nb::block!(uart.write(b'\r'));
+        let _ = nb::block!(uart.write(b'\n'));
+
+        // Wait a bit for module to process
+        cortex_m::asm::delay(8_400_000); // ~100ms at 84 MHz
+    }
+
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         let dp = cx.device;
@@ -119,6 +138,23 @@ mod app {
             SerialConfig::default().baudrate(115200.bps()),
             &mut rcc
         ).unwrap();
+
+        // Configure LoRa module before enabling RX interrupt
+        defmt::info!("Configuring LoRa module (Node 1)...");
+        send_at_command(&mut lora_uart, "AT");
+        send_at_command(&mut lora_uart, "AT+ADDRESS=1");
+
+        let mut cmd_buf: String<32> = String::new();
+        let _ = core::write!(cmd_buf, "AT+NETWORKID={}", NETWORK_ID);
+        send_at_command(&mut lora_uart, cmd_buf.as_str());
+
+        cmd_buf.clear();
+        let _ = core::write!(cmd_buf, "AT+BAND={}000000", LORA_FREQ);
+        send_at_command(&mut lora_uart, cmd_buf.as_str());
+
+        send_at_command(&mut lora_uart, "AT+PARAMETER=7,9,1,7");
+        defmt::info!("LoRa module configured");
+
         lora_uart.listen(SerialEvent::RxNotEmpty);
 
         // --- I2C1 ---
@@ -237,22 +273,27 @@ mod app {
                                 Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();
 
                                 buf.clear();
-                                // Line 3: TX status with packet counter
-                                let _ = core::write!(buf, "TX:{} #{:04}", trigger_source, *cx.local.packet_counter);
+                                // Line 3: Node ID and TX status with packet counter
+                                let _ = core::write!(buf, "{} TX:{} #{:04}", NODE_ID, trigger_source, *cx.local.packet_counter);
                                 Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();
 
                                 buf.clear();
-                                // Line 4: Countdown to next auto-TX
-                                let _ = core::write!(buf, "Next:{}s", *cx.local.tx_countdown);
+                                // Line 4: Network ID and frequency
+                                let _ = core::write!(buf, "Net:{} {}MHz", NETWORK_ID, LORA_FREQ);
                                 Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();
+
+                                buf.clear();
+                                // Line 5: Countdown to next auto-TX
+                                let _ = core::write!(buf, "Next:{}s", *cx.local.tx_countdown);
+                                Text::new(&buf, Point::new(0, 56), style).draw(disp).ok();
 
                                 let _ = disp.flush();
                             });
 
                             cx.shared.lora_uart.lock(|uart| {
                                 let mut pkt: String<64> = String::new();
-                                // Include packet counter in payload
-                                let _ = core::write!(pkt, "AT+SEND=0,25,T:{:.1}H:{:.1}G:{:.0}#{:04}\r\n",
+                                // Send to Node 2 (address 2) with packet counter
+                                let _ = core::write!(pkt, "AT+SEND=2,25,T:{:.1}H:{:.1}G:{:.0}#{:04}\r\n",
                                     temp_c, humid_pct, gas, *cx.local.packet_counter);
 
                                 defmt::info!("LoRa TX [{}]: {}", trigger_source, pkt.as_str());

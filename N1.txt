@@ -1,0 +1,1 @@
+probe-rs run --probe 0483:374b:0671FF3833554B3043164817 --chip STM32F446RETx target/thumbv7em-none-eabihf/release/wk2-lora-sensor-fusion
