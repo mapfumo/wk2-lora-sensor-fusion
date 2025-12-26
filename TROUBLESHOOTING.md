@@ -753,6 +753,72 @@ Parsed - T:28.8 H:64.1 G:104102 Pkt:1 RSSI:-20 SNR:12
 - User analysis identifying String<32> as bottleneck
 - Understanding that RYLR998 is NOT LoRaWAN (different protocol stack entirely)
 
+**IMPORTANT UPDATE - Final Resolution**:
+
+After implementing the buffer size fixes, Node 2 started receiving data but it was **scrambled/corrupted**:
+```
++RCV,25,26.857.51687#000-22,+R=1,,T:28H:2720-
+```
+
+**The Real Problem**: The diagnostic code added during earlier ORE debugging was interfering with UART reception timing!
+
+During the ORE flag debugging session (#9), extensive diagnostic code was added:
+
+- ORE flag checking and clearing
+- SR (Status Register) logging
+- CR1 register logging
+- Buffer content logging at specific sizes
+
+This diagnostic code, while well-intentioned, was **causing the scrambled data** by interfering with the timing-critical UART interrupt handler.
+
+**Critical Insight**: User correctly identified that if the working version at commit `80c7c5e` successfully receives data, it **cannot be a hardware issue** - the problem must be in the code changes.
+
+**Final Solution**:
+
+1. Compared with working UART handler from commit `80c7c5e`
+2. Restored the **simpler, cleaner** UART handler
+3. Kept the 255-byte buffer size improvement
+4. Removed ALL diagnostic code from UART interrupt handler
+
+**Working UART Handler** (src/bin/node2.rs:277-334):
+
+- Read all available bytes in one interrupt
+- Check for `\n` message terminator
+- Process complete message outside UART lock
+- Clear buffer for next message
+- **No ORE flag checking** - keep it simple!
+
+**Final Test Results** (December 2024):
+
+```text
+Node 1 Transmitting:
+LoRa TX [AUTO]: AT+SEND=2,25,T:26.9H:56.1G:178194#0001 (payload: 25 bytes)
+LoRa TX [AUTO]: AT+SEND=2,24,T:26.9H:56.1G:71371#0002 (payload: 24 bytes)
+LoRa TX [AUTO]: AT+SEND=2,24,T:26.9H:56.2G:71919#0003 (payload: 24 bytes)
+LoRa TX [AUTO]: AT+SEND=2,24,T:26.9H:56.2G:72662#0004 (payload: 24 bytes)
+
+Node 2 Receiving (Clean, No Corruption):
+LoRa RX: +RCV=1,25,T:26.9H:56.1G:178194#0001,-29,13
+Parsed - T:26.9 H:56.1 G:178194 Pkt:1 RSSI:-29 SNR:13
+LoRa RX: +RCV=1,24,T:26.9H:56.1G:71371#0002,-21,13
+Parsed - T:26.9 H:56.1 G:71371 Pkt:2 RSSI:-21 SNR:13
+LoRa RX: +RCV=1,24,T:26.9H:56.2G:71919#0003,-21,12
+Parsed - T:26.9 H:56.2 G:71919 Pkt:3 RSSI:-21 SNR:12
+LoRa RX: +RCV=1,24,T:26.9H:56.2G:72662#0004,-28,13
+Parsed - T:26.9 H:56.2 G:72662 Pkt:4 RSSI:-28 SNR:13
+```
+
+✅ **All data received correctly** - no scrambling or corruption
+✅ **Multiple consecutive packets** - continuous reception working
+✅ **Variable payload sizes** - handling 24-25 byte payloads dynamically
+✅ **Strong signal quality** - RSSI between -21 and -29 dBm
+
+**Additional Lessons Learned**:
+8. **Sometimes less code is better** - diagnostic code can interfere with timing-critical operations
+9. **Trust working versions** - if it worked before, hardware is fine; look at code changes
+10. **Keep interrupt handlers simple** - don't add extensive logging or checking in fast interrupt paths
+11. **Compare with working code** - git history is invaluable for identifying regressions
+
 ---
 
 ## Best Practices Learned

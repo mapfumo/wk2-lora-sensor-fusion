@@ -305,11 +305,14 @@ mod app {
 
                             cx.shared.lora_uart.lock(|uart| {
                                 // Build payload with sensor data
+                                // Format: T:<temp>H:<humidity>G:<gas>#<packet_num>
                                 let mut payload: String<128> = String::new();
                                 let _ = core::write!(payload, "T:{:.1}H:{:.1}G:{:.0}#{:04}",
                                     temp_c, humid_pct, gas, *cx.local.packet_counter);
 
-                                // Build AT command with dynamic length (RYLR998 supports up to 240 bytes)
+                                // Build AT command with dynamic length calculation
+                                // RYLR998 supports up to 240 bytes payload (not LoRaWAN's 51-byte limit!)
+                                // String<255> accommodates: "AT+SEND=2," (12) + length digits (3) + "," (1) + payload (128) = ~144 bytes
                                 let mut cmd: String<255> = String::new();
                                 let _ = core::write!(cmd, "AT+SEND=2,{},{}",
                                     payload.len(), payload.as_str());
@@ -317,12 +320,12 @@ mod app {
                                 defmt::info!("LoRa TX [{}]: {} (payload: {} bytes)",
                                     trigger_source, cmd.as_str(), payload.len());
 
-                                // Send command bytes
+                                // Send command bytes to LoRa module
                                 for b in cmd.as_bytes() {
                                     let _ = nb::block!(uart.write(*b));
                                 }
 
-                                // Send \r\n terminator AFTER the command
+                                // Send \r\n terminator AFTER the command (required by RYLR998 AT protocol)
                                 let _ = nb::block!(uart.write(b'\r'));
                                 let _ = nb::block!(uart.write(b'\n'));
 

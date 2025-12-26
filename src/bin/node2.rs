@@ -30,7 +30,14 @@ mod app {
 
     // --- Configuration Constants ---
     const NODE_ID: &str = "N2";              // Node identifier for display
-    const RX_BUFFER_SIZE: usize = 255;       // UART RX buffer size (RYLR998 max payload is 240 bytes)
+
+    // UART RX buffer size - sized for RYLR998 capabilities
+    // RYLR998 supports 240-byte payloads (NOT LoRaWAN's 51-byte limit!)
+    // RX format: "+RCV=<addr>,<len>,<data>,<rssi>,<snr>\r\n"
+    // Example: "+RCV=1,240,<240 bytes>,-20,12\r\n" = ~265 bytes total
+    // 255 bytes gives headroom for current payloads (~44 bytes) plus future expansion
+    const RX_BUFFER_SIZE: usize = 255;
+
     const NETWORK_ID: u8 = 18;               // LoRa network ID
     const LORA_FREQ: u32 = 915;              // LoRa frequency in MHz (915 for US)
 
@@ -274,8 +281,19 @@ mod app {
         }
     }
 
-    // UART interrupt: Fast receive and parse only - NO display updates
-    // This must complete quickly to allow subsequent interrupts to fire
+    // UART interrupt handler - Keep it simple!
+    //
+    // CRITICAL: This interrupt handler MUST be fast and simple.
+    // Previous attempts with extensive ORE flag checking, status register logging,
+    // and diagnostic code caused data corruption/scrambling.
+    //
+    // This simpler version from commit 80c7c5e works reliably:
+    // 1. Read all available bytes
+    // 2. Check for message terminator (\n)
+    // 3. Process complete message OUTSIDE the UART lock
+    // 4. Clear buffer for next message
+    //
+    // NO display updates here - those happen in the timer interrupt
     #[task(binds = UART4, shared = [lora_uart, last_packet, packets_received], local = [rx_buffer])]
     fn uart4_handler(mut cx: uart4_handler::Context) {
         // Read ALL available bytes from UART in one interrupt
@@ -286,7 +304,7 @@ mod app {
             // Drain all available bytes from UART buffer
             while let Ok(byte) = uart.read() {
                 bytes_read += 1;
-                // Add byte to buffer
+                // Add byte to buffer (with overflow protection)
                 if cx.local.rx_buffer.len() < RX_BUFFER_SIZE {
                     let _ = cx.local.rx_buffer.push(byte);
                 }
