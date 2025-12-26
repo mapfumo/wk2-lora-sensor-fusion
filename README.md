@@ -5,19 +5,36 @@ STM32F446RE-based sensor fusion system that reads temperature/humidity data from
 
 ## Overview
 
-This repository contains the firmware for **Node 1 (Remote Sensor Node)** of a 4-month embedded systems learning program. It is built using **Rust** and the **RTIC 1.1** framework for deterministic, interrupt-driven performance on the STM32F446RE.
+This repository contains the firmware for a **dual-node LoRa sensor network** as part of a 4-month embedded systems learning program. It is built using **Rust** and the **RTIC 1.1** framework for deterministic, interrupt-driven performance on the STM32F446RE.
 
-This node acts as a "Data Producer," aggregating environmental telemetry and broadcasting it via LoRa (RYLR998) to a central gateway.
+The system consists of:
+- **Node 1 (Remote Sensor Node)**: Data producer with multi-sensor fusion
+- **Node 2 (Gateway/Receiver)**: LoRa-to-serial bridge with local BMP280 sensor
 
 ## Hardware Configuration
 
+### Node 1 - Remote Sensor Node (Main Binary)
+
 - **MCU**: STM32F446RET6 (Cortex-M4F @ 84 MHz, HSI clock)
+- **Board**: NUCLEO-F446RE
 - **Radio**: REYAX RYLR998 LoRa Module (UART4 @ 115200 baud)
 - **Primary Sensor**: SHT31-D (Temperature & Humidity - Golden Reference)
 - **Secondary Sensor**: BME680 (Gas Resistance, Temperature, Humidity, Pressure)
 - **Display**: SSD1306 OLED 128x64 I2C
 - **Power**: Split-rail (Elegoo MB102 for LoRa, Nucleo for Logic)
 - **Debug**: LED on PA5
+- **ST-Link Probe**: `0483:374b:0671FF3833554B3043164817`
+
+### Node 2 - Gateway/Receiver (node2 Binary)
+
+- **MCU**: STM32F446RET6 (Cortex-M4F @ 84 MHz, HSI clock)
+- **Board**: NUCLEO-F446RE
+- **Radio**: REYAX RYLR998 LoRa Module (UART4 @ 115200 baud)
+- **Sensor**: BMP280 (Temperature & Pressure - local reference)
+- **Display**: SSD1306 OLED 128x64 I2C
+- **Power**: USB-powered via ST-Link
+- **Debug**: LED on PA5
+- **ST-Link Probe**: `0483:374b:066DFF3833584B3043115433`
 
 ## Pin Configuration
 
@@ -42,14 +59,64 @@ This node acts as a "Data Producer," aggregating environmental telemetry and bro
 
 ## Building
 
+### Build Node 1 (Sensor Node)
 ```bash
 cargo build --release
 ```
 
-## Flashing
+### Build Node 2 (Gateway)
+```bash
+cargo build --release --bin node2
+```
+
+## Flashing & Development
+
+### Single Computer, Dual-Probe Setup
+
+This project supports **simultaneous development on both nodes** using a single computer with two ST-Link probes connected via USB. Each NUCLEO board has a unique ST-Link serial number, allowing probe-rs to target specific devices.
+
+### Flash Node 1
+```bash
+cargo build --release && probe-rs run --probe 0483:374b:0671FF3833554B3043164817 --chip STM32F446RETx target/thumbv7em-none-eabihf/release/wk2-lora-sensor-fusion
+```
+
+### Flash Node 2
+```bash
+cargo build --release --bin node2 && probe-rs run --probe 0483:374b:066DFF3833584B3043115433 --chip STM32F446RETx target/thumbv7em-none-eabihf/release/node2
+```
+
+### Finding Your Probe Serial Numbers
+
+If replicating this setup with your own NUCLEO boards:
 
 ```bash
-probe-rs run --chip STM32F446RETx target/thumbv7em-none-eabihf/release/wk2-lora-sensor-fusion
+probe-rs list
+```
+
+Output will show:
+```
+[0]: STLink V2-1 -- 0483:374b:XXXXXXXXXXXXXXXXXXXX (ST-LINK)
+[1]: STLink V2-1 -- 0483:374b:YYYYYYYYYYYYYYYYYYYY (ST-LINK)
+```
+
+Use the `VID:PID:SerialNumber` format with the `--probe` flag.
+
+### Shell Aliases (Recommended)
+
+For convenience, add to your shell config:
+
+```bash
+# Node 1 (replace serial with your actual probe)
+alias n1='cargo build --release && probe-rs run --probe 0483:374b:0671FF3833554B3043164817 --chip STM32F446RETx target/thumbv7em-none-eabihf/release/wk2-lora-sensor-fusion'
+
+# Node 2 (replace serial with your actual probe)
+alias n2='cargo build --release --bin node2 && probe-rs run --probe 0483:374b:066DFF3833584B3043115433 --chip STM32F446RETx target/thumbv7em-none-eabihf/release/node2'
+```
+
+Then simply run:
+```bash
+n1  # Flash and monitor Node 1
+n2  # Flash and monitor Node 2
 ```
 
 ## Display Output
