@@ -149,7 +149,10 @@ wk2-lora-sensor-fusion/
 - [x] Temperature Conversion Fixes (centidegrees → °C)
 - [x] Humidity Conversion (basis points → %)
 - [x] Optimized Display Layout (4 lines, space-efficient)
-- [ ] LoRa End-to-End Testing
+- [x] Hybrid Transmission Mode (Button + Auto-timer)
+- [x] Packet Counter Implementation
+- [x] LoRa Transmission Verified (Logic Analyzer)
+- [ ] LoRa End-to-End Reception Testing (Node 2)
 - [ ] Range Testing with RSSI/SNR
 - [ ] Binary Serialization (Week 3)
 

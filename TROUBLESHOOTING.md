@@ -359,6 +359,101 @@ Line_N_Y = TOP_MARGIN + (N - 1) × LINE_SPACING
 
 ---
 
+## Hardware Verification
+
+### 8. Verifying LoRa Transmission with Logic Analyzer
+
+**Context**: When implementing LoRa transmission, it's not enough to see the OLED display update - you need to verify that actual UART data is being sent to the LoRa module.
+
+**Problem**: How do you prove that the STM32 is correctly transmitting AT commands to the RYLR998 LoRa module?
+
+**Solution**: Use a logic analyzer to capture and decode the UART transmission.
+
+**Hardware Setup**:
+```
+Logic Analyzer Connections:
+  CH0 (or any channel) → PC10 (UART4 TX - STM32 to LoRa module)
+  GND                  → GND (common ground)
+  [Optional] CH1       → PC11 (UART4 RX - LoRa module responses)
+```
+
+**PulseView Configuration**:
+1. **Sample Rate**: 1-4 MHz (for 115200 baud UART)
+2. **Protocol Decoder**: UART (Async Serial)
+3. **Decoder Settings**:
+   - RX channel: CH0 (connected to TX pin)
+   - Baud rate: `115200`
+   - Data bits: `8`
+   - Parity: `none`
+   - Stop bits: `1`
+   - Bit order: `lsb-first`
+   - Format: `ascii`
+   - RX polarity: `idle high`
+4. **Trigger**: Falling edge on CH0 (optional, but helpful)
+
+**Example Capture - Successful Transmission**:
+
+```
+Decoded UART Output:
+AT+SEND=0,25,T:29.8H:62.1G:52174#0308\r\n
+
+Raw Hex:
+41 54 2B 53 45 4E 44 3D 30 2C 32 35 2C 54 3A 32
+39 2E 38 48 3A 36 32 2E 31 47 3A 35 32 31 37 34
+23 30 33 30 38 0D 0A
+```
+
+**Packet Breakdown**:
+| Portion | Value | Meaning |
+|---------|-------|---------|
+| `AT+SEND=0,25,` | Command header | Send to address 0, payload 25 bytes |
+| `T:29.8` | Temperature | 29.8°C from SHT31 sensor |
+| `H:62.1` | Humidity | 62.1% RH from SHT31 sensor |
+| `G:52174` | Gas resistance | 52,174Ω from BME680 sensor |
+| `#0308` | Packet counter | Sequential packet number (308) |
+| `\r\n` | Terminator | Carriage return + line feed (0x0D 0x0A) |
+
+**Key Observations from Capture**:
+- ✅ Baud rate is correct (115200) - characters decode cleanly
+- ✅ AT command format is valid
+- ✅ Sensor data matches OLED display values
+- ✅ Packet counter increments with each transmission
+- ✅ Proper line termination (`\r\n`)
+
+**Common Frame Errors**:
+If you see "Frame error" warnings in the decoder output:
+- **At start of capture**: Usually harmless - occurred before trigger stabilized
+- **During transmission**: Check connections, verify baud rate, ensure clean power
+- **Intermittent**: May indicate noise, poor connections, or timing issues
+
+**What This Proves**:
+1. STM32 UART is functioning correctly
+2. Correct baud rate configuration (115200)
+3. Data is reaching the LoRa module's RX pin
+4. Packet format is correct and complete
+5. Button/timer triggers are working as expected
+
+**Next Steps After Verification**:
+- If you also capture PC11 (UART RX), you should see `+OK\r\n` responses from the LoRa module
+- For end-to-end verification, set up a second node to receive and decode these LoRa transmissions
+- For range testing, this packet counter allows you to calculate packet loss percentage
+
+**Tools Used**:
+- **Hardware**: DIGISHUO 24MHz 8CH Logic Analyzer (or similar)
+- **Software**: PulseView (open-source logic analyzer GUI)
+- **Protocol**: UART/Async Serial decoder
+
+**Debugging Tip**: If you don't see clean UART data:
+1. Verify connection to PC10 (not PC11)
+2. Check GND is connected
+3. Increase sample rate (try 4 MHz)
+4. Adjust trigger settings
+5. Verify baud rate in both firmware and decoder match exactly
+
+**Code Location**: [main.rs:244-257](src/main.rs#L244-L257)
+
+---
+
 ## Best Practices Learned
 
 1. **Check HAL version compatibility**: API changes between minor versions can be significant

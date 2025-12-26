@@ -32,6 +32,10 @@ mod app {
     use bme680::{Bme680, I2CAddress, IIRFilterSize, OversamplingSetting, SettingsBuilder, PowerMode};
     use core::time::Duration;
 
+    // --- Configuration Constants ---
+    const AUTO_TX_INTERVAL_SECS: u32 = 10;  // Auto-transmit every 10 seconds
+    const DEBOUNCE_MS: u32 = 200;            // Button debounce time in milliseconds
+
     // --- Bridge for embedded-hal 1.0 -> 0.2.7 ---
     pub struct I2cCompat<I2C>(pub I2C);
 
@@ -78,8 +82,11 @@ mod app {
     #[local]
     struct Local {
         led: Pin<'A', 5, Output>,
+        button: Pin<'C', 13>,  // Blue button on Nucleo (PC13)
         timer: CounterHz<pac::TIM2>,
         bme_delay: BmeDelay,
+        packet_counter: u32,   // Counts packets sent
+        tx_countdown: u32,     // Seconds until next auto-transmit
     }
 
     #[init]
@@ -95,6 +102,7 @@ mod app {
         let gpioc = dp.GPIOC.split(&mut rcc);
 
         let led = gpioa.pa5.into_push_pull_output();
+        let button = gpioc.pc13;  // Blue button (has built-in pull-up, active-low)
 
         // Create delay instances for SHT31 and BME680
         // SHT31 takes ownership of its delay (TIM5)
@@ -143,78 +151,123 @@ mod app {
 
         // --- Timer ---
         let mut timer = dp.TIM2.counter_hz(&mut rcc);
-        timer.start(1.Hz()).unwrap();
+        timer.start(1.Hz()).unwrap();  // Still ticks at 1 Hz for countdown
         timer.listen(Event::Update);
 
-        (Shared { lora_uart, display, sht31, bme680 }, Local { led, timer, bme_delay }, init::Monotonics())
+        (
+            Shared { lora_uart, display, sht31, bme680 },
+            Local {
+                led,
+                button,
+                timer,
+                bme_delay,
+                packet_counter: 0,                    // Start at packet #0
+                tx_countdown: AUTO_TX_INTERVAL_SECS,  // First TX in 10 seconds
+            },
+            init::Monotonics()
+        )
     }
 
-    #[task(binds = TIM2, shared = [sht31, bme680, display, lora_uart], local = [led, timer, bme_delay])]
+    #[task(binds = TIM2, shared = [sht31, bme680, display, lora_uart], local = [led, button, timer, bme_delay, packet_counter, tx_countdown])]
     fn tim2_handler(mut cx: tim2_handler::Context) {
         cx.local.timer.clear_flags(stm32f4xx_hal::timer::Flag::Update);
         cx.local.led.toggle();
-        let delay = cx.local.bme_delay;
 
-        cx.shared.bme680.lock(|bme| { 
-            let _ = bme.set_sensor_mode(delay, PowerMode::ForcedMode); 
-        });
-        
-        delay.delay_ms(200u32);
+        // Determine if we should transmit this cycle
+        let mut should_transmit = false;
+        let mut trigger_source = "AUTO";
 
-        cx.shared.bme680.lock(|bme| {
-            if let Ok((data, _state)) = bme.get_sensor_data(delay) {
-                // BME680 used only for gas resistance (SHT31 is more accurate for temp/humidity)
-                let gas = data.gas_resistance_ohm();
-
-                cx.shared.sht31.lock(|sht| {
-                    if let Ok(meas) = sht.measure(Repeatability::High) {
-                        cx.shared.display.lock(|disp: &mut LoraDisplay| {
-                            let _ = disp.clear(BinaryColor::Off);
-                            let style = MonoTextStyleBuilder::new()
-                                .font(&FONT_6X10)
-                                .text_color(BinaryColor::On)
-                                .build();
-                            
-                            let mut buf: String<64> = String::new();
-                            // Line 1: Temp & Humidity (compact)
-                            let temp_c = meas.temperature as f32 / 100.0;
-                            let humid_pct = meas.humidity as f32 / 100.0;
-                            let _ = core::write!(buf, "T:{:.1}C H:{:.0}%", temp_c, humid_pct);
-                            Text::new(&buf, Point::new(0, 8), style).draw(disp).ok();
-
-                            buf.clear();
-                            // Line 2: Gas resistance
-                            let _ = core::write!(buf, "Gas:{:.0}k", gas as f32 / 1000.0);
-                            Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();
-
-                            buf.clear();
-                            // Line 3: LoRa metadata placeholder
-                            let _ = core::write!(buf, "ID:01 RSSI:--");
-                            Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();
-
-                            buf.clear();
-                            // Line 4: More LoRa stats
-                            let _ = core::write!(buf, "SNR:-- #---");
-                            Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();
-                            
-                            let _ = disp.flush();
-                        });
-
-                        cx.shared.lora_uart.lock(|uart| {
-                            let mut pkt: String<64> = String::new();
-                            // SHT31: temp in centidegrees (÷100), humidity in basis points (÷100)
-                            let temp_c = meas.temperature as f32 / 100.0;
-                            let humid_pct = meas.humidity as f32 / 100.0;
-                            let _ = core::write!(pkt, "AT+SEND=0,20,T:{:.1}H:{:.1}G:{:.0}\r\n",
-                                temp_c, humid_pct, gas);
-                            for b in pkt.as_bytes() {
-                                let _ = nb::block!(uart.write(*b));
-                            }
-                        });
-                    }
-                });
+        // Check button (active-low: pressed = low)
+        if cx.local.button.is_low() {
+            defmt::info!("Button pressed - triggering immediate transmission");
+            should_transmit = true;
+            trigger_source = "BTN";
+            *cx.local.tx_countdown = AUTO_TX_INTERVAL_SECS;  // Reset countdown
+        } else {
+            // Auto-transmit countdown
+            if *cx.local.tx_countdown > 0 {
+                *cx.local.tx_countdown -= 1;
             }
-        });
+
+            if *cx.local.tx_countdown == 0 {
+                defmt::info!("Auto-transmit countdown reached 0");
+                should_transmit = true;
+                *cx.local.tx_countdown = AUTO_TX_INTERVAL_SECS;  // Reset countdown
+            }
+        }
+
+        // Only read sensors and transmit if triggered
+        if should_transmit {
+            let delay = cx.local.bme_delay;
+
+            cx.shared.bme680.lock(|bme| {
+                let _ = bme.set_sensor_mode(delay, PowerMode::ForcedMode);
+            });
+
+            delay.delay_ms(200u32);
+
+            cx.shared.bme680.lock(|bme| {
+                if let Ok((data, _state)) = bme.get_sensor_data(delay) {
+                    // BME680 used only for gas resistance (SHT31 is more accurate for temp/humidity)
+                    let gas = data.gas_resistance_ohm();
+
+                    cx.shared.sht31.lock(|sht| {
+                        if let Ok(meas) = sht.measure(Repeatability::High) {
+                            let temp_c = meas.temperature as f32 / 100.0;
+                            let humid_pct = meas.humidity as f32 / 100.0;
+
+                            // Increment packet counter
+                            *cx.local.packet_counter += 1;
+
+                            cx.shared.display.lock(|disp: &mut LoraDisplay| {
+                                let _ = disp.clear(BinaryColor::Off);
+                                let style = MonoTextStyleBuilder::new()
+                                    .font(&FONT_6X10)
+                                    .text_color(BinaryColor::On)
+                                    .build();
+
+                                let mut buf: String<64> = String::new();
+                                // Line 1: Temp & Humidity (compact)
+                                let _ = core::write!(buf, "T:{:.1}C H:{:.0}%", temp_c, humid_pct);
+                                Text::new(&buf, Point::new(0, 8), style).draw(disp).ok();
+
+                                buf.clear();
+                                // Line 2: Gas resistance
+                                let _ = core::write!(buf, "Gas:{:.0}k", gas as f32 / 1000.0);
+                                Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();
+
+                                buf.clear();
+                                // Line 3: TX status with packet counter
+                                let _ = core::write!(buf, "TX:{} #{:04}", trigger_source, *cx.local.packet_counter);
+                                Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();
+
+                                buf.clear();
+                                // Line 4: Countdown to next auto-TX
+                                let _ = core::write!(buf, "Next:{}s", *cx.local.tx_countdown);
+                                Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();
+
+                                let _ = disp.flush();
+                            });
+
+                            cx.shared.lora_uart.lock(|uart| {
+                                let mut pkt: String<64> = String::new();
+                                // Include packet counter in payload
+                                let _ = core::write!(pkt, "AT+SEND=0,25,T:{:.1}H:{:.1}G:{:.0}#{:04}\r\n",
+                                    temp_c, humid_pct, gas, *cx.local.packet_counter);
+
+                                defmt::info!("LoRa TX [{}]: {}", trigger_source, pkt.as_str());
+
+                                for b in pkt.as_bytes() {
+                                    let _ = nb::block!(uart.write(*b));
+                                }
+
+                                defmt::info!("Transmission complete - packet #{}", *cx.local.packet_counter);
+                            });
+                        }
+                    });
+                }
+            });
+        }
     }
 
     #[task(binds = UART4, shared = [lora_uart])]
