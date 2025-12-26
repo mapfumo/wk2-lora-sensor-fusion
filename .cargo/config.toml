@@ -1,0 +1,19 @@
+# === TARGET CONFIGURATION ===
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+
+# Runner: probe-rs will flash the binary and decode RTT/defmt logs
+runner = "probe-rs run --chip STM32F446RETx"
+
+# Linker flags
+rustflags = [
+  "-C", "link-arg=-Tlink.x",  # Standard Cortex-M linker script
+  "-C", "link-arg=-Tdefmt.x", # <--- Essential: Tells the linker how to handle defmt logs
+]
+
+# === DEFAULT BUILD TARGET ===
+[build]
+target = "thumbv7em-none-eabihf" # Cortex-M4F (STM32F4)
+
+# === ENVIRONMENT VARIABLES ===
+[env]
+DEFMT_LOG = "info"

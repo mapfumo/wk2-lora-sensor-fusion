@@ -1,0 +1,463 @@
+# Troubleshooting Guide
+
+This document records all issues encountered during development and their solutions. Useful for similar projects.
+
+## Compilation Errors
+
+### 1. `I2CDisplayInterface` not found in scope
+
+**Error Message:**
+```
+error[E0425]: cannot find type `I2CDisplayInterface` in this scope
+  --> src/main.rs:66:32
+   |
+66 |     type LoraDisplay = Ssd1306<I2CDisplayInterface, DisplaySize128x64, ...>;
+   |                                ^^^^^^^^^^^^^^^^^^^ not found in this scope
+```
+
+**Cause**: The type name changed between versions of `display-interface-i2c`. The crate uses `I2CInterface` not `I2CDisplayInterface`.
+
+**Solution**: Use `I2CInterface` with the correct generic parameter:
+```rust
+// Before (incorrect)
+type LoraDisplay = Ssd1306<I2CDisplayInterface, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>;
+
+// After (correct)
+type LoraDisplay = Ssd1306<I2CInterface<I2cProxy>, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>;
+```
+
+**Location**: [main.rs:67](src/main.rs#L67)
+
+**Fix Applied**: Changed type alias to use `I2CInterface<I2cProxy>`
+
+---
+
+### 2. Field `cfgr` is private
+
+**Error Message:**
+```
+error[E0616]: field `cfgr` of struct `stm32f4xx_hal::pac::rcc::RegisterBlock` is private
+  --> src/main.rs:91:26
+   |
+91 |         let clocks = rcc.cfgr.sysclk(84.MHz()).freeze();
+   |                          ^^^^ private field
+```
+
+**Cause**: stm32f4xx-hal 0.23.0 changed the RCC configuration API completely. The old `constrain()` → `cfgr` → `freeze()` pattern no longer works.
+
+**Solution**: Use the new `freeze()` API with `Config`:
+```rust
+// Old API (0.20.x) - DOESN'T WORK
+let rcc = dp.RCC.constrain();
+let clocks = rcc.cfgr.sysclk(84.MHz()).freeze();
+let timer = Timer::new(dp.TIM2, &clocks);
+
+// New API (0.23.0) - CORRECT
+use stm32f4xx_hal::rcc::Config;
+
+let mut rcc = dp.RCC.freeze(Config::hsi().sysclk(84.MHz()));
+let timer = dp.TIM2.counter_hz(&mut rcc);
+```
+
+Also update all peripheral initializations:
+```rust
+// Old: pass &clocks
+Serial::new(dp.UART4, (tx, rx), config, &clocks)
+I2c::new(dp.I2C1, (scl, sda), 100.kHz(), &clocks)
+
+// New: pass &mut rcc
+Serial::new(dp.UART4, (tx, rx), config, &mut rcc)
+I2c::new(dp.I2C1, (scl, sda), 100.kHz(), &mut rcc)
+```
+
+**Locations Affected**:
+- [main.rs:89](src/main.rs#L89) - RCC configuration
+- [main.rs:107-112](src/main.rs#L107-L112) - UART4 initialization
+- [main.rs:118](src/main.rs#L118) - I2C1 initialization
+- [main.rs:144](src/main.rs#L144) - Timer initialization
+
+**References**:
+- [stm32f4xx-hal 0.23.0 examples](https://github.com/stm32-rs/stm32f4xx-hal/tree/master/examples)
+- [RCC documentation](https://docs.rs/stm32f4xx-hal/0.23.0/stm32f4xx_hal/rcc/index.html)
+
+---
+
+### 3. Type annotations needed for closure
+
+**Error Message:**
+```
+error[E0282]: type annotations needed
+   --> src/main.rs:167:49
+    |
+167 |                         cx.shared.display.lock(|disp| {
+    |                                                 ^^^^
+168 |                             let _ = disp.clear(BinaryColor::Off);
+    |                                     ---- type must be known at this point
+```
+
+**Cause**: Rust compiler cannot infer the type of the closure parameter when using RTIC's resource locking. The type needs to be explicit.
+
+**Solution**: Add explicit type annotation to the closure parameter:
+```rust
+// Before (compiler can't infer)
+cx.shared.display.lock(|disp| {
+    let _ = disp.clear(BinaryColor::Off);
+});
+
+// After (explicit type)
+cx.shared.display.lock(|disp: &mut LoraDisplay| {
+    let _ = disp.clear(BinaryColor::Off);
+});
+```
+
+**Location**: [main.rs:170](src/main.rs#L170)
+
+**Why This Happens**: RTIC's lock mechanism uses generic closures, and without explicit types, the compiler cannot always deduce the concrete type from usage alone.
+
+---
+
+### 4. Borrow of moved value: `delay`
+
+**Error Message:**
+```
+error[E0382]: borrow of moved value: `delay`
+   --> src/main.rs:120:58
+    |
+ 97 |         let mut delay = dp.TIM3.delay_ms(&mut rcc);
+    |             --------- move occurs because `delay` has type `Delay<...>`, which does not implement the `Copy` trait
+...
+119 |         let sht31 = SHT3x::new(bus.acquire_i2c(), delay, ShtAddress::Low);
+    |                                                   ----- value moved here
+120 |         let mut bme680 = Bme680::init(bus.acquire_i2c(), &mut delay, I2CAddress::Secondary).unwrap();
+    |                                                          ^^^^^^^^^^ value borrowed here after move
+```
+
+**Cause**: The `SHT3x::new()` function takes ownership of the delay (moves it), so it cannot be used by `bme680` afterward. Different APIs have different ownership requirements:
+- SHT3x takes ownership: `fn new(i2c: I2C, delay: D, ...)`
+- BME680 borrows: `fn init(i2c: I2C, delay: &mut D, ...)`
+
+**Solution**: Create separate delay instances using different hardware timers:
+```rust
+// Create separate delay instances
+let sht_delay = dp.TIM5.delay_us(&mut rcc);  // For SHT31 (will be owned)
+let mut bme_delay = dp.TIM3.delay_us(&mut rcc);  // For BME680 (will be borrowed)
+
+// Use different delays
+let sht31 = SHT3x::new(bus.acquire_i2c(), sht_delay, ShtAddress::Low);
+let mut bme680 = Bme680::init(bus.acquire_i2c(), &mut bme_delay, I2CAddress::Secondary).unwrap();
+```
+
+Update type aliases to match:
+```rust
+type ShtDelay = Delay<pac::TIM5, 1000000>;
+type BmeDelay = Delay<pac::TIM3, 1000000>;
+```
+
+**Locations**:
+- [main.rs:100-102](src/main.rs#L100-L102) - Delay creation
+- [main.rs:62-63](src/main.rs#L62-L63) - Type definitions
+- [main.rs:73-74](src/main.rs#L73-L74) - Shared struct types
+
+**Key Lesson**: Always check whether functions take ownership (`T`) or borrow (`&T` or `&mut T`). When in doubt, check the function signature in the documentation.
+
+---
+
+## Runtime Errors
+
+### 5. TryFromIntError in delay_ms
+
+**Error Message:**
+```
+[ERROR] panicked at stm32f4xx-hal-0.23.0/src/timer.rs:960:55:
+called `Result::unwrap()` on an `Err` value: TryFromIntError(())
+
+Frame 12: delay<...> @ 0x00000000080002fa inline
+       stm32f4xx-hal-0.23.0/src/timer.rs:230:9
+Frame 13: delay_ms<...> @ 0x00000000080002fa inline
+       stm32f4xx-hal-0.23.0/src/timer.rs:212:14
+```
+
+**Cause**: Timer prescaler calculation fails when trying to convert the system clock frequency to the delay timer frequency. The `delay_ms()` function uses 1 kHz (1000 Hz) as the timer frequency, which causes integer overflow/underflow in the prescaler calculation when using an 84 MHz HSI clock.
+
+**Root Cause Analysis**:
+- System clock: 84 MHz (84,000,000 Hz)
+- `delay_ms()` target: 1 kHz (1,000 Hz)
+- Prescaler calculation: `(84_000_000 / 1_000) - 1`
+- This large division causes TryFromIntError in the type conversion
+
+**Solution**: Use `delay_us()` with 1 MHz frequency instead:
+```rust
+// Don't use this (causes TryFromIntError with HSI clock)
+let delay = dp.TIM3.delay_ms(&mut rcc);  // 1000 Hz frequency
+type MyDelay = Delay<pac::TIM3, 1000>;
+
+// Use this instead (works reliably)
+let delay = dp.TIM3.delay_us(&mut rcc);  // 1_000_000 Hz frequency
+type MyDelay = Delay<pac::TIM3, 1000000>;
+```
+
+**Important**: The delay object still supports millisecond operations via `delay.delay_ms(200)`, but the internal timer runs at microsecond precision (1 MHz).
+
+**Affected Lines**:
+- [main.rs:100-102](src/main.rs#L100-L102) - Delay creation
+- [main.rs:62-63](src/main.rs#L62-L63) - Type definitions
+
+**Why This Works**: A 1 MHz timer frequency (1,000,000 Hz) results in a smaller, more manageable prescaler value that fits within the integer type bounds.
+
+**General Rule**: For STM32 timers with stm32f4xx-hal 0.23.0:
+- ✅ Use `delay_us()` for new code
+- ❌ Avoid `delay_ms()` unless using very low clock speeds
+
+---
+
+## Data Interpretation Issues
+
+### 6. Incorrect Temperature Readings (2852°C in Brisbane)
+
+**Symptom**: Display shows unrealistic temperatures like 2852°C for indoor environment in Brisbane, Australia (expected ~25-30°C).
+
+**Initial Investigation**:
+```rust
+// Code showing raw value
+let _ = core::write!(buf, "SHT: {:.1}C", meas.temperature);
+// Displayed: "SHT: 2852C"
+```
+
+**Cause**: The `sht3x` crate (v0.1.1) returns temperature as `i32` in **centidegrees Celsius** (°C × 100), not degrees Celsius.
+
+**Deep Dive - Source Code Analysis**:
+```rust
+// From https://github.com/miek/sht3x-rs/blob/master/src/lib.rs
+pub struct Measurement {
+    pub temperature: i32,  // ← centidegrees (°C × 100)
+    pub humidity: u16,     // ← basis points (0.01% RH)
+}
+
+// Conversion formula from raw sensor data
+const fn convert_temperature(raw: u16) -> i32 {
+    -4500 + (17500 * raw as i32) / 65535
+    // Returns centidegrees: e.g., 2852 = 28.52°C
+}
+```
+
+**Understanding the Math**:
+- Sensor returns 16-bit raw value (0-65535)
+- Formula scales to -45.00°C to +130.00°C range
+- Result is in centidegrees for integer precision
+- Example: raw value 2852 → 28.52°C actual temperature
+
+**Solution**: Convert centidegrees to degrees Celsius:
+```rust
+// Display conversion
+let _ = core::write!(buf, "SHT: {:.1}C", meas.temperature as f32 / 100.0);
+// Now displays: "SHT: 28.5C" ✓
+
+// LoRa packet conversion
+let _ = core::write!(pkt, "AT+SEND=0,16,S:{:.1}B:{:.1}G:{:.0}\r\n",
+    meas.temperature as f32 / 100.0,  // Convert to °C
+    t_bme,  // Already in °C
+    gas);
+```
+
+**Affected Lines**:
+- [main.rs:179-180](src/main.rs#L179-L180) - Display output
+- [main.rs:196-197](src/main.rs#L196-L197) - LoRa transmission
+
+**Key Lesson**: Always verify sensor data representation in driver documentation AND source code. Common patterns:
+- **Raw ADC values**: Need calibration formula
+- **Fixed-point scaled integers**: millidegrees (÷1000), centidegrees (÷100), decidegrees (÷10)
+- **Floating-point values**: Direct use (but check units!)
+- **Basis points**: Percentages × 100 (e.g., 5000 = 50.00%)
+
+**Verification Steps**:
+1. Check crate documentation at docs.rs
+2. Read the source code (especially conversion functions)
+3. Test with known reference values (ice water = 0°C, body temp ≈ 37°C)
+4. Compare with other sensors if available
+
+**References**:
+- [sht3x-rs repository](https://github.com/miek/sht3x-rs)
+- [sht3x-rs source code](https://github.com/miek/sht3x-rs/blob/master/src/lib.rs)
+- [SHT3x datasheet](https://www.sensirion.com/fileadmin/user_upload/customers/sensirion/Dokumente/2_Humidity_Sensors/Datasheets/Sensirion_Humidity_Sensors_SHT3x_Datasheet_digital.pdf)
+
+---
+
+### 7. Display Text Clipping on OLED
+
+**Symptom**: First line of text "T:28.5C H:55%" appears truncated or cut off at the top of the SSD1306 128x64 OLED display.
+
+**User Report**: "T:28.5C H:55% being truncated on OLED. Probably an offset thing"
+
+**Initial Investigation**:
+```rust
+// Original code with text starting at y=0
+Text::new(&buf, Point::new(0, 0), style).draw(disp).ok();   // Line 1
+Text::new(&buf, Point::new(0, 12), style).draw(disp).ok();  // Line 2
+Text::new(&buf, Point::new(0, 24), style).draw(disp).ok();  // Line 3
+Text::new(&buf, Point::new(0, 36), style).draw(disp).ok();  // Line 4
+```
+
+**Cause**: Font ascenders and descenders are clipped when text baseline is positioned at y=0. The FONT_6X10 font has:
+- Total height: 10 pixels
+- Character glyphs extend both above and below the baseline
+- Starting at y=0 causes the top portions of characters to render off-screen
+
+**Root Cause Analysis**:
+- Display coordinate system: (0,0) is top-left corner
+- Font rendering: Baseline is at the y-coordinate, but glyphs extend upward
+- FONT_6X10 needs ~8 pixels above baseline for tall characters (capitals, ascenders)
+- Starting at y=0 provides no room for these upper pixels
+
+**Solution**: Add proper top margin and adjust line spacing:
+```rust
+// Corrected code with 8-pixel top margin
+Text::new(&buf, Point::new(0, 8), style).draw(disp).ok();   // Line 1 (y=8)
+Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();  // Line 2 (y=8+12)
+Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();  // Line 3 (y=20+12)
+Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();  // Line 4 (y=32+12)
+```
+
+**Layout Calculation**:
+- Top margin: 8 pixels (prevents clipping)
+- Line spacing: 12 pixels (10px font height + 2px gap)
+- Line 1 baseline: y = 8
+- Line 2 baseline: y = 8 + 12 = 20
+- Line 3 baseline: y = 20 + 12 = 32
+- Line 4 baseline: y = 32 + 12 = 44
+- Bottom of last line: y = 44 + 10 = 54
+- Remaining space: 64 - 54 = 10 pixels for future use
+
+**Affected Lines**:
+- [main.rs:183](src/main.rs#L183) - Line 1 display position
+- [main.rs:188](src/main.rs#L188) - Line 2 display position
+- [main.rs:193](src/main.rs#L193) - Line 3 display position
+- [main.rs:198](src/main.rs#L198) - Line 4 display position
+
+**Key Lesson**: When working with bitmap fonts on small displays:
+1. **Understand font metrics**: Know the baseline, ascent, and descent of your font
+2. **Test with varied characters**: Some characters (like 'T', 'H', 'g', 'y') extend further
+3. **Add margins**: Always leave space at top and bottom edges
+4. **Calculate spacing**: Font height + gap between lines
+5. **Verify on hardware**: Text rendering issues may not be obvious in documentation
+
+**General Formula for Multi-Line Text**:
+```
+TOP_MARGIN = font_ascent (typically 6-8 pixels for 10px font)
+LINE_SPACING = font_height + inter_line_gap
+Line_N_Y = TOP_MARGIN + (N - 1) × LINE_SPACING
+```
+
+**Font-Specific Guidelines**:
+- **FONT_6X10**: Use y=8 start, 12px spacing (tested and working)
+- **FONT_6X12**: Use y=10 start, 14px spacing
+- **FONT_6X13**: Use y=11 start, 15px spacing
+
+**References**:
+- [SSD1306 coordinate system](https://cdn-shop.adafruit.com/datasheets/SSD1306.pdf)
+- [embedded-graphics text positioning](https://docs.rs/embedded-graphics/latest/embedded_graphics/text/index.html)
+- [FONT_6X10 documentation](https://docs.rs/embedded-graphics/latest/embedded_graphics/mono_font/ascii/constant.FONT_6X10.html)
+
+---
+
+## Best Practices Learned
+
+1. **Check HAL version compatibility**: API changes between minor versions can be significant
+2. **Read driver source code**: Documentation may not specify data representation clearly
+3. **One timer per delay consumer**: Avoid ownership conflicts by allocating separate timers
+4. **Use microsecond timers**: Better compatibility with prescaler calculations (use `delay_us()`)
+5. **Test with real hardware early**: Compilation success ≠ correct behavior
+6. **Verify units immediately**: Don't assume sensor values are in expected units
+7. **Keep type aliases updated**: They document the system architecture
+8. **Use defmt for debugging**: Much more efficient than ITM/semihosting
+9. **Understand sensor characteristics**: Different sensors excel at different measurements (sensor fusion)
+10. **Account for font metrics**: Add proper margins for text rendering to prevent clipping
+11. **Plan display layouts**: Calculate spacing and verify sufficient room for future expansion
+
+## Quick Reference
+
+### Common stm32f4xx-hal 0.23.0 Patterns
+
+```rust
+// Must import Config
+use stm32f4xx_hal::rcc::Config;
+
+// RCC setup with HSI
+let mut rcc = dp.RCC.freeze(Config::hsi().sysclk(84.MHz()));
+
+// GPIO split (requires &mut rcc)
+let gpioa = dp.GPIOA.split(&mut rcc);
+
+// Delays (use delay_us, not delay_ms!)
+let delay = dp.TIM3.delay_us(&mut rcc);
+type MyDelay = Delay<pac::TIM3, 1000000>;  // 1 MHz
+
+// I2C initialization
+let i2c = I2c::new(dp.I2C1, (scl, sda), 100.kHz(), &mut rcc);
+
+// Serial/UART initialization
+let uart = Serial::new(
+    dp.UART4,
+    (tx, rx),
+    SerialConfig::default().baudrate(115200.bps()),
+    &mut rcc
+).unwrap();
+
+// Timer/Counter initialization
+let timer = dp.TIM2.counter_hz(&mut rcc);
+timer.start(1.Hz()).unwrap();
+timer.listen(Event::Update);
+```
+
+### Debugging Steps
+
+1. **Compilation error**:
+   - Check stm32f4xx-hal version and API docs
+   - Search GitHub issues for the HAL crate
+   - Look at official examples in the HAL repository
+
+2. **Runtime panic**:
+   - Enable defmt logging with RTT
+   - Check stack trace for panic location
+   - Verify clock configuration
+   - Check timer/prescaler settings
+
+3. **Wrong sensor values**:
+   - Verify data type and conversion in driver source code
+   - Test with known reference (ice water, room temp)
+   - Compare multiple sensors
+   - Check sensor datasheet for value ranges
+
+4. **I2C issues**:
+   - Verify pull-up resistors (typically 4.7kΩ)
+   - Check bus speed (100 kHz is safest)
+   - Verify device addresses with i2cdetect
+   - Ensure proper power supply
+
+5. **Timer issues**:
+   - Use `delay_us()` instead of `delay_ms()`
+   - Verify prescaler calculations
+   - Check clock source configuration
+
+### Common Gotchas
+
+| Issue | Symptom | Solution |
+|-------|---------|----------|
+| Moved value | Borrow after move error | Use separate instances or clone |
+| Private field | Can't access `.cfgr` | Update to new API with `Config` |
+| TryFromIntError | Panic in timer setup | Use `delay_us()` not `delay_ms()` |
+| Wrong sensor values | Unrealistic readings | Check data scaling (÷100, ÷1000, etc) |
+| Type inference | Closure type needed | Add explicit type annotation |
+| I2C bus sharing | Ownership conflicts | Use `shared-bus` crate |
+| Display text clipping | Top line cut off | Start at y=8 with 12px spacing for FONT_6X10 |
+
+---
+
+## Version Information
+
+This troubleshooting guide was created for:
+- **stm32f4xx-hal**: 0.23.0
+- **RTIC**: 1.1
+- **Rust Edition**: 2021
+- **Target**: thumbv7em-none-eabihf
+
+API changes in future versions may require updates to these solutions.
