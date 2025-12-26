@@ -30,7 +30,7 @@ mod app {
 
     // --- Configuration Constants ---
     const NODE_ID: &str = "N2";              // Node identifier for display
-    const RX_BUFFER_SIZE: usize = 128;       // UART RX buffer size
+    const RX_BUFFER_SIZE: usize = 255;       // UART RX buffer size (RYLR998 max payload is 240 bytes)
     const NETWORK_ID: u8 = 18;               // LoRa network ID
     const LORA_FREQ: u32 = 915;              // LoRa frequency in MHz (915 for US)
 
@@ -79,8 +79,8 @@ mod app {
     struct Shared {
         lora_uart: Serial<pac::UART4>,
         display: LoraDisplay,
-        last_packet: Option<ParsedMessage>,  // Store last received packet for display update
-        packets_received: u32,               // Total packets received counter
+        last_packet: Option<ParsedMessage>,
+        packets_received: u32,
     }
 
     #[local]
@@ -88,6 +88,13 @@ mod app {
         led: Pin<'A', 5, Output>,
         timer: CounterHz<pac::TIM2>,
         rx_buffer: Vec<u8, RX_BUFFER_SIZE>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct ParsedMessage {
+        pub sensor_data: SensorData,
+        pub rssi: i16,
+        pub snr: i16,
     }
 
     // Helper function to send AT command and wait for response
@@ -149,6 +156,15 @@ mod app {
         // Flush any pending responses from configuration BEFORE enabling interrupt
         while lora_uart.read().is_ok() {}
 
+        // Explicitly clear any error flags (especially ORE) before enabling interrupt
+        let uart_ptr = unsafe { &*pac::UART4::ptr() };
+        let sr = uart_ptr.sr().read();
+        if sr.ore().bit_is_set() || sr.nf().bit_is_set() || sr.fe().bit_is_set() {
+            let _ = uart_ptr.dr().read();
+            defmt::info!("N2 INIT: Cleared error flags (ORE={} NF={} FE={})",
+                sr.ore().bit_is_set(), sr.nf().bit_is_set(), sr.fe().bit_is_set());
+        }
+
         defmt::info!("LoRa module configured");
         lora_uart.listen(SerialEvent::RxNotEmpty);
 
@@ -190,8 +206,8 @@ mod app {
             Shared {
                 lora_uart,
                 display,
-                last_packet: None,     // No packet received yet
-                packets_received: 0,   // Start counter at 0
+                last_packet: None,
+                packets_received: 0,
             },
             Local {
                 led,
@@ -202,72 +218,60 @@ mod app {
         )
     }
 
-    // Timer interrupt: Handle LED toggling and display updates
-    // This runs at 2Hz and is separate from UART interrupt
     #[task(binds = TIM2, shared = [display, last_packet, packets_received], local = [led, timer])]
     fn tim2_handler(mut cx: tim2_handler::Context) {
         cx.local.timer.clear_flags(stm32f4xx_hal::timer::Flag::Update);
         cx.local.led.toggle();
 
-        // Update display with last received packet data
-        cx.shared.display.lock(|disp| {
-            cx.shared.last_packet.lock(|last_pkt| {
-                cx.shared.packets_received.lock(|pkt_count| {
-                    let _ = disp.clear(BinaryColor::Off);
-                    let style = MonoTextStyleBuilder::new()
-                        .font(&FONT_6X10)
-                        .text_color(BinaryColor::On)
-                        .build();
+        // Copy packet data quickly while holding lock
+        let packet_copy = cx.shared.last_packet.lock(|pkt_opt| *pkt_opt);
+        let total_count = cx.shared.packets_received.lock(|count| *count);
 
-                    if let Some(parsed) = last_pkt {
-                        // Display received sensor data
-                        let mut buf: String<64> = String::new();
+        defmt::info!("N2 Timer: total_count={}, has_packet={}", total_count, packet_copy.is_some());
 
-                        // Line 1: Temperature & Humidity
-                        let _ = core::write!(buf, "T:{:.1}C H:{:.0}%",
-                            parsed.sensor_data.temperature, parsed.sensor_data.humidity);
-                        Text::new(&buf, Point::new(0, 8), style).draw(disp).ok();
+        // Update display OUTSIDE locks (slow I2C is OK here in timer context)
+        if let Some(parsed) = packet_copy {
+            cx.shared.display.lock(|disp| {
+                let _ = disp.clear(BinaryColor::Off);
+                let style = MonoTextStyleBuilder::new()
+                    .font(&FONT_6X10)
+                    .text_color(BinaryColor::On)
+                    .build();
 
-                        buf.clear();
-                        // Line 2: Gas resistance
-                        let _ = core::write!(buf, "Gas:{:.0}k",
-                            parsed.sensor_data.gas_resistance as f32 / 1000.0);
-                        Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();
+                let mut buf: String<64> = String::new();
 
-                        buf.clear();
-                        // Line 3: Node ID and packet info
-                        let _ = core::write!(buf, "{} RX #{:04}",
-                            NODE_ID, parsed.sensor_data.packet_num);
-                        Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();
+                // Line 1: Temperature & Humidity
+                let _ = core::write!(buf, "T:{:.1}C H:{:.0}%",
+                    parsed.sensor_data.temperature, parsed.sensor_data.humidity);
+                Text::new(&buf, Point::new(0, 8), style).draw(disp).ok();
 
-                        buf.clear();
-                        // Line 4: Network ID and frequency
-                        let _ = core::write!(buf, "Net:{} {}MHz",
-                            NETWORK_ID, LORA_FREQ);
-                        Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();
+                buf.clear();
+                // Line 2: Gas resistance
+                let _ = core::write!(buf, "Gas:{:.0}k",
+                    parsed.sensor_data.gas_resistance as f32 / 1000.0);
+                Text::new(&buf, Point::new(0, 20), style).draw(disp).ok();
 
-                        buf.clear();
-                        // Line 5: RSSI and SNR with total count
-                        let _ = core::write!(buf, "RSSI:{} SNR:{} #{}",
-                            parsed.rssi, parsed.snr, *pkt_count);
-                        Text::new(&buf, Point::new(0, 56), style).draw(disp).ok();
-                    } else {
-                        // No packet received yet - show waiting message
-                        Text::new("N2 RECEIVER", Point::new(0, 8), style).draw(disp).ok();
+                buf.clear();
+                // Line 3: Node ID and packet info
+                let _ = core::write!(buf, "{} RX #{:04}",
+                    NODE_ID, parsed.sensor_data.packet_num);
+                Text::new(&buf, Point::new(0, 32), style).draw(disp).ok();
 
-                        let mut init_buf: String<32> = String::new();
-                        let _ = core::write!(init_buf, "Net:{} {}MHz", NETWORK_ID, LORA_FREQ);
-                        Text::new(&init_buf, Point::new(0, 20), style).draw(disp).ok();
+                buf.clear();
+                // Line 4: Network ID and frequency
+                let _ = core::write!(buf, "Net:{} {}MHz",
+                    NETWORK_ID, LORA_FREQ);
+                Text::new(&buf, Point::new(0, 44), style).draw(disp).ok();
 
-                        Text::new("Waiting...", Point::new(0, 32), style).draw(disp).ok();
-                    }
+                buf.clear();
+                // Line 5: RSSI and SNR with total count
+                let _ = core::write!(buf, "RSSI:{} SNR:{} #{}",
+                    parsed.rssi, parsed.snr, total_count);
+                Text::new(&buf, Point::new(0, 56), style).draw(disp).ok();
 
-                    // Flush display buffer to I2C - this is the slow operation (10-50ms)
-                    // But it's OK here in timer context, not blocking UART interrupts
-                    let _ = disp.flush();
-                });
+                let _ = disp.flush();  // Slow I2C flush is safe here
             });
-        });
+        }
     }
 
     // UART interrupt: Fast receive and parse only - NO display updates
@@ -327,13 +331,6 @@ mod app {
             // Clear buffer for next message
             cx.local.rx_buffer.clear();
         }
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct ParsedMessage {
-        pub sensor_data: SensorData,
-        pub rssi: i16,
-        pub snr: i16,
     }
 
     fn parse_lora_message(msg: &str) -> Option<ParsedMessage> {

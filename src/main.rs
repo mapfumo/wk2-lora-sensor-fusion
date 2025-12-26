@@ -153,6 +153,19 @@ mod app {
         send_at_command(&mut lora_uart, cmd_buf.as_str());
 
         send_at_command(&mut lora_uart, "AT+PARAMETER=7,9,1,7");
+
+        // Flush any pending responses from configuration
+        while lora_uart.read().is_ok() {}
+
+        // Explicitly clear any error flags (especially ORE) before enabling interrupt
+        let uart_ptr = unsafe { &*pac::UART4::ptr() };
+        let sr = uart_ptr.sr().read();
+        if sr.ore().bit_is_set() || sr.nf().bit_is_set() || sr.fe().bit_is_set() {
+            let _ = uart_ptr.dr().read();
+            defmt::info!("N1 INIT: Cleared error flags (ORE={} NF={} FE={})",
+                sr.ore().bit_is_set(), sr.nf().bit_is_set(), sr.fe().bit_is_set());
+        }
+
         defmt::info!("LoRa module configured");
 
         lora_uart.listen(SerialEvent::RxNotEmpty);
@@ -291,16 +304,21 @@ mod app {
                             });
 
                             cx.shared.lora_uart.lock(|uart| {
-                                let mut pkt: String<64> = String::new();
-                                // Send to Node 2 (address 2) with packet counter
-                                // NOTE: Do NOT include \r\n in the string - send it separately!
-                                let _ = core::write!(pkt, "AT+SEND=2,25,T:{:.1}H:{:.1}G:{:.0}#{:04}",
+                                // Build payload with sensor data
+                                let mut payload: String<128> = String::new();
+                                let _ = core::write!(payload, "T:{:.1}H:{:.1}G:{:.0}#{:04}",
                                     temp_c, humid_pct, gas, *cx.local.packet_counter);
 
-                                defmt::info!("LoRa TX [{}]: {}", trigger_source, pkt.as_str());
+                                // Build AT command with dynamic length (RYLR998 supports up to 240 bytes)
+                                let mut cmd: String<255> = String::new();
+                                let _ = core::write!(cmd, "AT+SEND=2,{},{}",
+                                    payload.len(), payload.as_str());
+
+                                defmt::info!("LoRa TX [{}]: {} (payload: {} bytes)",
+                                    trigger_source, cmd.as_str(), payload.len());
 
                                 // Send command bytes
-                                for b in pkt.as_bytes() {
+                                for b in cmd.as_bytes() {
                                     let _ = nb::block!(uart.write(*b));
                                 }
 
@@ -317,13 +335,33 @@ mod app {
         }
     }
 
-    // UART interrupt: Drain all incoming bytes (LoRa module responses like +OK)
+    // UART interrupt: Drain all incoming bytes AND clear error flags
     // This must drain the buffer to prevent it from filling up and blocking transmissions
+    // CRITICAL: Must clear Overrun Error (ORE) or UART stops working entirely
     #[task(binds = UART4, shared = [lora_uart])]
     fn uart4_handler(mut cx: uart4_handler::Context) {
         cx.shared.lora_uart.lock(|uart| {
             // Drain ALL available bytes from UART buffer
-            while uart.read().is_ok() {}
+            let mut drained = 0;
+            while uart.read().is_ok() {
+                drained += 1;
+            }
+
+            if drained > 0 {
+                defmt::info!("N1 UART: drained {} bytes", drained);
+            }
+
+            // AFTER draining data, check and clear error flags
+            // At this point, RXNE should be clear, so reading DR won't consume data
+            let uart_ptr = unsafe { &*pac::UART4::ptr() };
+            let sr = uart_ptr.sr().read();
+
+            if sr.ore().bit_is_set() || sr.nf().bit_is_set() || sr.fe().bit_is_set() {
+                // Clear errors by reading DR (should be empty now)
+                let _ = uart_ptr.dr().read();
+                defmt::warn!("N1 UART4 errors cleared (ORE={} NF={} FE={})",
+                    sr.ore().bit_is_set(), sr.nf().bit_is_set(), sr.fe().bit_is_set());
+            }
         });
     }
 }

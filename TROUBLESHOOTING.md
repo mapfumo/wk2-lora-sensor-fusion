@@ -454,6 +454,307 @@ If you see "Frame error" warnings in the decoder output:
 
 ---
 
+## LoRa Communication Issues
+
+### 9. Node 2 Only Receives First Packet, Then Stops
+
+**Context**: System uses RYLR998 LoRa modules with UART AT commands. Node 1 (transmitter) sends sensor data to Node 2 (receiver) every 10 seconds.
+
+**Problem**: Node 2 successfully receives and displays the first packet, then receives NO subsequent packets even though Node 1 continues transmitting successfully.
+
+**Symptoms**:
+- Node 1 logs show continuous successful transmissions (packets #1, #2, #3, etc.)
+- Node 2 logs show ONLY the first packet received
+- Node 2 UART interrupts stop firing after processing first packet
+- Hardware and wiring verified working (first packet proves this)
+- Issue persists even with previously-working committed code after power cycle
+
+**Root Cause**: UART Overrun Error (ORE) flag not properly cleared, blocking future interrupts.
+
+RYLR998 LoRa modules are **command-response devices**, not fire-and-forget:
+- After `AT+SEND`, module responds with `+OK\r\n` and `+SENT\r\n`
+- These responses fill the UART RX buffer if not drained
+- When buffer overruns, the ORE flag is set in the Status Register
+- **If ORE is not cleared, UART stops triggering RX interrupts entirely**
+- This causes both transmitter and receiver to stop working after first packet
+
+**Failed Approaches** (what didn't work):
+1. ❌ Moving display I2C operations to timer interrupt (architectural improvement, but didn't fix the core issue)
+2. ❌ Changing from `if let Ok(byte)` to `while let Ok(byte)` for buffer draining (helped but incomplete)
+3. ❌ Fixing AT command format to send `\r\n` separately (correct, but not the blocker)
+4. ❌ Checking ORE flag BEFORE draining data (consumed valid data bytes)
+
+**Correct Solution**: Drain data FIRST, then clear error flags AFTER
+
+```rust
+#[task(binds = UART4, shared = [lora_uart, last_packet, packets_received], local = [rx_buffer])]
+fn uart4_handler(mut cx: uart4_handler::Context) {
+    let mut should_process = false;
+    let mut bytes_read = 0u16;
+
+    cx.shared.lora_uart.lock(|uart| {
+        // 1. FIRST: Drain all available data bytes
+        while let Ok(byte) = uart.read() {
+            bytes_read += 1;
+            if cx.local.rx_buffer.len() < RX_BUFFER_SIZE {
+                let _ = cx.local.rx_buffer.push(byte);
+            }
+            if byte == b'\n' {
+                should_process = true;
+            }
+        }
+
+        // 2. AFTER draining: Check and clear error flags
+        // At this point, RXNE is clear, so reading DR won't consume data
+        let uart_ptr = unsafe { &*pac::UART4::ptr() };
+        let sr = uart_ptr.sr().read();
+
+        if sr.ore().bit_is_set() || sr.nf().bit_is_set() || sr.fe().bit_is_set() {
+            // Clear errors by reading DR (FIFO is empty now)
+            let _ = uart_ptr.dr().read();
+            defmt::warn!("UART4 errors cleared (ORE={} NF={} FE={})",
+                sr.ore().bit_is_set(), sr.nf().bit_is_set(), sr.fe().bit_is_set());
+        }
+    });
+
+    // 3. Process message OUTSIDE uart lock
+    if should_process {
+        // ... parse and handle message
+        cx.local.rx_buffer.clear();
+    }
+}
+```
+
+**Why This Order Matters**:
+
+1. **Reading SR then DR clears error flags** (per STM32 reference manual)
+2. **If you read DR when RXNE is set, you consume a data byte**
+3. **By draining data FIRST, then checking errors, DR is empty when we clear flags**
+4. **This prevents data loss while still clearing ORE to re-enable interrupts**
+
+**Critical STM32 UART Details**:
+
+| Flag | Meaning | How to Clear | Impact if Not Cleared |
+|------|---------|--------------|----------------------|
+| ORE  | Overrun Error - new byte arrived while RXNE still set | Read SR, then read DR | **UART stops triggering interrupts** |
+| NE   | Noise Error - noise detected on RX line | Read SR, then read DR | Corrupted data |
+| FE   | Framing Error - stop bit not detected | Read SR, then read DR | Corrupted data |
+
+**Additional Fixes Applied**:
+
+1. **CRITICAL - Clear ORE flag during initialization**:
+   ```rust
+   // After AT command configuration, BEFORE enabling interrupt
+   send_at_command(&mut lora_uart, "AT+PARAMETER=7,9,1,7");
+
+   // Flush any pending responses
+   while lora_uart.read().is_ok() {}
+
+   // Explicitly clear any error flags - if ORE is set, interrupts won't fire!
+   let uart_ptr = unsafe { &*pac::UART4::ptr() };
+   let sr = uart_ptr.sr().read();
+   if sr.ore().bit_is_set() || sr.nf().bit_is_set() || sr.fe().bit_is_set() {
+       let _ = uart_ptr.dr().read();
+       defmt::info!("INIT: Cleared error flags (ORE={} NF={} FE={})",
+           sr.ore().bit_is_set(), sr.nf().bit_is_set(), sr.fe().bit_is_set());
+   }
+
+   // NOW it's safe to enable interrupt
+   lora_uart.listen(SerialEvent::RxNotEmpty);
+   ```
+
+2. **Node 1 - Drain LoRa module responses**:
+   ```rust
+   // After AT+SEND, module responds with +OK and +SENT
+   // Must drain these or buffer fills and ORE blocks future TX
+   #[task(binds = UART4, shared = [lora_uart])]
+   fn uart4_handler(mut cx: uart4_handler::Context) {
+       cx.shared.lora_uart.lock(|uart| {
+           let mut drained = 0;
+           while uart.read().is_ok() {
+               drained += 1;
+           }
+           // ... then check and clear error flags
+       });
+   }
+   ```
+
+3. **Node 2 - Separate UART and Display operations**:
+   - UART interrupt: Fast receive and parse only (no I2C operations)
+   - Timer interrupt: Update display with parsed data
+   - This prevents slow I2C display flush (~10-50ms) from blocking UART interrupts
+
+4. **AT Command Format**:
+   ```rust
+   // WRONG: Embedded \r\n gets sent byte-by-byte
+   let _ = core::write!(pkt, "AT+SEND=2,25,...\r\n");
+   for b in pkt.as_bytes() { uart.write(*b); }
+
+   // CORRECT: Send \r\n separately after command
+   let _ = core::write!(pkt, "AT+SEND=2,25,...");
+   for b in pkt.as_bytes() { uart.write(*b); }
+   uart.write(b'\r');
+   uart.write(b'\n');
+   ```
+
+**Testing the Fix**:
+
+Before fix:
+```
+Node 1: TX #1, #2, #3, #4...  (transmitting continuously)
+Node 2: RX #1 ... (then nothing, UART interrupts stop)
+```
+
+After fix:
+```
+Node 1: TX #1, #2, #3, #4...  (transmitting continuously)
+Node 2: RX #1, #2, #3, #4...  (receiving all packets)
+```
+
+**Key Learnings**:
+
+1. **UART LoRa modules are NOT fire-and-forget** - they send responses that must be drained
+2. **ORE flag MUST be cleared** or UART peripheral locks up entirely
+3. **Order matters**: Drain data BEFORE clearing errors to avoid data loss
+4. **UART interrupts arriving one-byte-at-a-time is suspicious** - indicates FIFO not filling or interrupts too slow
+5. **Always check both TX and RX sides** - both can have buffer issues
+6. **Power cycling can mask the issue** - makes it seem intermittent when it's actually systematic
+
+**Code Locations**:
+- Node 1 (Transmitter): [src/main.rs:323-348](src/main.rs#L323-L348)
+- Node 2 (Receiver): [src/bin/node2.rs:275-342](src/bin/node2.rs#L275-L342)
+
+**References**:
+- [STM32F446 Reference Manual - USART section 30.6.1 (Status Register)](https://www.st.com/resource/en/reference_manual/dm00135183.pdf)
+- [RYLR998 AT Command Guide](https://reyax.com/products/rylr998/)
+- GitHub issues reporting similar UART ORE problems with STM32
+
+---
+
+### 10. LoRa Message Truncation - Buffer Size Not LoRa Protocol Limit
+
+**Context**: After fixing the ORE flag issue (#9), Node 2 appeared to still have problems - not receiving packets completely or displaying data. Investigation initially focused on LoRa payload limits.
+
+**Symptom**: Messages appeared to be truncated at ~28-30 bytes, leading to incomplete packet reception and `should_process` never becoming true (missing `\n` terminator).
+
+**Initial Theory (INCORRECT)**: LoRa spreading factor (SF7) was limiting payload to ~30 bytes over the air.
+
+**Actual Root Cause**: `heapless::String<32>` and `String<64>` buffers in Rust code were too small to hold complete AT commands with full sensor data payloads.
+
+**Hardware Specifications - RYLR998 LoRa Module**:
+- **Maximum Payload**: 240 bytes per message
+- **AT Command Format**: `AT+SEND=<addr>,<len>,<data>`
+- **Response Format**: `+RCV=<addr>,<len>,<data>,<rssi>,<snr>\r\n`
+- **Protocol**: Not subject to LoRaWAN 51-byte limit (uses proprietary protocol)
+
+**The Real Problem - Software Buffer Constraints**:
+
+Node 1 (Transmitter):
+```rust
+// PROBLEM: Buffer too small for command string
+let mut pkt: String<64> = String::new();
+let _ = core::write!(pkt, "AT+SEND=2,25,T:{:.1}H:{:.1}G:{:.0}#{:04}",
+    temp_c, humid_pct, gas, packet_counter);
+// String too long → core::write! returns Err → packet never sent!
+```
+
+Payload: `T:28.8H:64.1G:104102#0001` (25 bytes)
+Full command: `AT+SEND=2,25,T:28.8H:64.1G:104102#0001` (~38 bytes)
+**Buffer capacity: 64 bytes** → Barely fits, no room for longer gas values!
+
+Node 2 (Receiver):
+```rust
+const RX_BUFFER_SIZE: usize = 128;  // Too small!
+```
+
+Expected RX: `+RCV=1,25,T:28.8H:64.1G:104102#0001,-20,12\r\n` (~44 bytes)
+**Buffer capacity: 128 bytes** → Appears OK but doesn't leave margin for full 240-byte payloads
+
+**How Buffer Overflow Manifests**:
+1. **Silent failure**: `core::write!()` returns `Err` but code doesn't check result
+2. **Partial strings**: Buffer fills to capacity, rest is dropped
+3. **Missing terminators**: If `\n` doesn't fit in buffer, message never processes
+4. **Inconsistent behavior**: Works with short test payloads, fails with real sensor data
+
+**Solution**: Increase buffer sizes to support full RYLR998 capability (240 bytes)
+
+Node 1 (Transmitter):
+```rust
+// Build payload separately
+let mut payload: String<128> = String::new();
+let _ = core::write!(payload, "T:{:.1}H:{:.1}G:{:.0}#{:04}",
+    temp_c, humid_pct, gas, packet_counter);
+
+// Build AT command with dynamic length
+let mut cmd: String<255> = String::new();
+let _ = core::write!(cmd, "AT+SEND=2,{},{}",
+    payload.len(), payload.as_str());
+```
+
+Node 2 (Receiver):
+```rust
+const RX_BUFFER_SIZE: usize = 255;  // Support full 240-byte payload + overhead
+```
+
+**Why This Wasn't Obvious**:
+1. Test payload `TEST#0001` was only 10 bytes - fit easily in small buffers
+2. No error checking on `core::write!()` results
+3. UART appeared to work correctly (it was!)
+4. Focus on LoRa protocol limits instead of application buffers
+5. Misleading search results about LoRaWAN 51-byte limit (doesn't apply to RYLR998)
+
+**Key Differences - LoRaWAN vs RYLR998**:
+
+| Feature | LoRaWAN | RYLR998 (Reyax) |
+|---------|---------|-----------------|
+| Max Payload | 51-222 bytes (SF-dependent) | **240 bytes** (hardware limit) |
+| Protocol | LoRaWAN standard | Proprietary AT commands |
+| Network | Infrastructure mode | Peer-to-peer |
+| Duty Cycle | EU 868: 1% limit | User-managed |
+| Addressing | DevEUI/AppEUI | Simple 0-65535 addresses |
+
+**Diagnostic Observations That Led to Discovery**:
+
+From external analysis provided by user:
+1. "drained 1 bytes" logs → UART working correctly, reading `+OK\r\n` responses
+2. Node 2 showing `has_packet=false` → Never finding message terminator
+3. AT command hardcoded length (`AT+SEND=2,10,...`) → Should be dynamic
+4. String<32> buffers throughout init code → Pattern of undersized buffers
+
+**Testing After Fix**:
+```
+Node 1 Log:
+LoRa TX [AUTO]: AT+SEND=2,25,T:28.8H:64.1G:104102#0001 (payload: 25 bytes)
+Transmission complete - packet #1
+
+Node 2 Log:
+N2 UART interrupt fired
+N2 UART: drained 44 bytes, should_process=true, buf_len=44
+LoRa RX: +RCV=1,25,T:28.8H:64.1G:104102#0001,-20,12
+Parsed - T:28.8 H:64.1 G:104102 Pkt:1 RSSI:-20 SNR:12
+```
+
+**General Lessons**:
+
+1. **Always check buffer sizes against maximum payload** - don't assume "reasonable" values
+2. **Hardware limits ≠ Software limits** - your buffers can be the real constraint
+3. **Check `core::write!()` return values** - silent failures are hard to debug
+4. **Use dynamic length calculations** - don't hardcode payload sizes
+5. **Research the ACTUAL hardware** - don't assume all LoRa modules follow LoRaWAN specs
+6. **Test with maximum-size payloads** - short test data won't reveal buffer issues
+7. **Embedded Rust: `heapless` sizes are HARD LIMITS** - no dynamic growth like std::String
+
+**Code Locations**:
+- Node 1: [src/main.rs:307-330](src/main.rs#L307-L330) - Payload and command building
+- Node 2: [src/bin/node2.rs:33](src/bin/node2.rs#L33) - RX_BUFFER_SIZE constant
+
+**External Resources That Helped**:
+- RYLR998 datasheet confirming 240-byte limit
+- User analysis identifying String<32> as bottleneck
+- Understanding that RYLR998 is NOT LoRaWAN (different protocol stack entirely)
+
+---
+
 ## Best Practices Learned
 
 1. **Check HAL version compatibility**: API changes between minor versions can be significant
