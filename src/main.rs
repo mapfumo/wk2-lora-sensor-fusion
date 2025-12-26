@@ -293,14 +293,20 @@ mod app {
                             cx.shared.lora_uart.lock(|uart| {
                                 let mut pkt: String<64> = String::new();
                                 // Send to Node 2 (address 2) with packet counter
-                                let _ = core::write!(pkt, "AT+SEND=2,25,T:{:.1}H:{:.1}G:{:.0}#{:04}\r\n",
+                                // NOTE: Do NOT include \r\n in the string - send it separately!
+                                let _ = core::write!(pkt, "AT+SEND=2,25,T:{:.1}H:{:.1}G:{:.0}#{:04}",
                                     temp_c, humid_pct, gas, *cx.local.packet_counter);
 
                                 defmt::info!("LoRa TX [{}]: {}", trigger_source, pkt.as_str());
 
+                                // Send command bytes
                                 for b in pkt.as_bytes() {
                                     let _ = nb::block!(uart.write(*b));
                                 }
+
+                                // Send \r\n terminator AFTER the command
+                                let _ = nb::block!(uart.write(b'\r'));
+                                let _ = nb::block!(uart.write(b'\n'));
 
                                 defmt::info!("Transmission complete - packet #{}", *cx.local.packet_counter);
                             });
@@ -311,10 +317,13 @@ mod app {
         }
     }
 
+    // UART interrupt: Drain all incoming bytes (LoRa module responses like +OK)
+    // This must drain the buffer to prevent it from filling up and blocking transmissions
     #[task(binds = UART4, shared = [lora_uart])]
     fn uart4_handler(mut cx: uart4_handler::Context) {
         cx.shared.lora_uart.lock(|uart| {
-            if let Ok(_b) = uart.read() { }
+            // Drain ALL available bytes from UART buffer
+            while uart.read().is_ok() {}
         });
     }
 }
